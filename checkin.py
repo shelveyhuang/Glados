@@ -99,6 +99,8 @@ class Config:
 
     ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
     ENV_SERVERCHAN_KEY = "SERVERCHAN_SENDKEY"
+    ENV_TG_BOT_TOKEN = "TG_BOT_TOKEN"
+    ENV_TG_CHAT_ID = "TG_CHAT_ID"
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
@@ -122,6 +124,8 @@ class Config:
     def __init__(self):
         self.push_key: str = ""
         self.serverchan_key: str = ""
+        self.tg_bot_token: str = ""
+        self.tg_chat_id: str = ""
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
@@ -132,6 +136,10 @@ class Config:
         push_key_env: Optional[str] = os.environ.get(self.ENV_PUSH_KEY)
         serverchan_key_env: Optional[str] = os.environ.get(self.ENV_SERVERCHAN_KEY)
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
+        self.tg_bot_token = (os.environ.get(self.ENV_TG_BOT_TOKEN) or "").strip()
+        self.tg_chat_id = (os.environ.get(self.ENV_TG_CHAT_ID) or "").strip()
+        if bool(self.tg_bot_token) != bool(self.tg_chat_id):
+            logger.warning(f"{LogEmoji.WARNING} Telegram 推送需要同时设置 '{self.ENV_TG_BOT_TOKEN}' 和 '{self.ENV_TG_CHAT_ID}'，当前只设置了一个，将跳过 Telegram 推送。")
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
 
@@ -168,6 +176,7 @@ class Config:
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}，{self.ENV_SERVERCHAN_KEY} {'已设置' if serverchan_key_env else '未设置'}。")
+        logger.info(f"{LogEmoji.INFO} 当前 Telegram 推送 {'已设置' if (self.tg_bot_token and self.tg_chat_id) else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
         if verbose_env is not None:
@@ -554,6 +563,38 @@ class ServerChanBackend(PushBackend):
             return False
 
 
+class TelegramBackend(PushBackend):
+    """Telegram 机器人后端（直接调用 Bot API sendMessage）"""
+
+    name = "Telegram"
+
+    def __init__(self, bot_token: str, chat_id: str):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+
+    def send(self, title: str, payload: dict) -> bool:
+        text = f"{title}\n\n{self._render(payload)}".strip()
+        # Telegram 单条消息上限 4096 字符
+        if len(text) > 4000:
+            text = text[:4000] + "\n……（内容过长已截断）"
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        try:
+            resp = requests.post(
+                url,
+                json={"chat_id": self.chat_id, "text": text, "disable_web_page_preview": True},
+                timeout=15,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                return True
+            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: {data.get('description', resp.text)}")
+            return False
+        except Exception as e:
+            # 不打印异常原文，避免把 bot token 写进日志
+            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: {type(e).__name__}")
+            return False
+
+
 class PushService:
     """推送服务：聚合多个后端，向全部已配置后端发送（都发）"""
 
@@ -564,6 +605,8 @@ class PushService:
                 self.backends.append(PushDeerBackend(config.push_key))
             if getattr(config, "serverchan_key", ""):
                 self.backends.append(ServerChanBackend(config.serverchan_key))
+            if getattr(config, "tg_bot_token", "") and getattr(config, "tg_chat_id", ""):
+                self.backends.append(TelegramBackend(config.tg_bot_token, config.tg_chat_id))
 
     def send(self, title: str, payload: dict) -> bool:
         """向所有已配置后端发送推送，只要有一个成功即视为成功"""
